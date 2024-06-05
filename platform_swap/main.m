@@ -113,7 +113,7 @@ static int ad_hoc_codesign_file(const char *path) {
         return -1;
     }
     
-    OSStatus status = SecCodeSignerCreate((__bridge CFDictionaryRef)(dict),  /*kSecCSDefaultFlags*/ 1, &ref);
+    OSStatus status = SecCodeSignerCreate((__bridge CFDictionaryRef)(dict),  /*kSecCSDefaultFlags*/ 0, &ref);
     if (status) {
         log_error("SecCodeSignerCreate error: %d\n", status);
         return -1;
@@ -210,101 +210,66 @@ int main(int argc, const char * argv[]) {
     long bugfix = strtol(argv[5], NULL, 10);
     
     char * endOfHeader = header->sizeofcmds + ptr + sizeof(struct mach_header_64);
-    // we only need this if we are converting to iOS simulator
-    NSData *entitlementsData = platform == PLATFORM_IOSSIMULATOR && getenv("ENTITLEMENTS") ? entitlements_data_for_file(path) : nil;
+    
+    
+    // we need to insert a weak lc command before the signature if it's in use, so do an initial loop over and search for it
+    bool shouldInsertDylib = getenv("INJECT")  ? true : false;
+    struct segment_command_64 *found_signature_lc = NULL;
+    if (shouldInsertDylib) {
+        for (int i = 0; i < header->ncmds; i++) {
+            if (cur->cmd == LC_CODE_SIGNATURE) {
+                found_signature_lc = (void*)cur;
+                assert(i == header->ncmds - 1);
+                break;
+            }
+            cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
+        }
+    }
+    
+    
+    cur = (void*)((uintptr_t)ptr + (uintptr_t)sizeof(struct mach_header_64));
     for (int i = 0; i < header->ncmds; i++) {
         
-        if (entitlementsData) {
-            bool needsEntitlementPatching = true;
-            if (cur->cmd == LC_SEGMENT_64) {
-                struct segment_command_64 *segment = (void*)cur;
-                
-                if (!strncmp(segment->segname, "__PAGEZERO", 16)) {
-                    struct segment_command_64 *segment = (void*)cur;
-                    segment->initprot = 5;
-                    segment->maxprot = 5;
-
-                }
-                
-                if (!strncmp(segment->segname, "__TEXT", 16)) {
-                    struct section_64 *section = (void*)((uintptr_t)cur + sizeof(struct segment_command_64));
-                    for (int k = 0 ; k < segment->nsects; k++) {
-                        // need to make sure there's enough space after the mach header and before the code
-                        if (k == 0) {
-                            if (section->offset - (header->sizeofcmds + sizeof(struct mach_header_64)) > (sizeof(struct section_64) * 2) + entitlementsData.length) {
-                                log_error("we dont have enough space after the mach-o header to inset the entitlements\n");
-                                exit(1);
-                            }
-                        }
-                        if (!strcmp(section->sectname, "__entitlements") || !strcmp(section->sectname, "__ent_der")) {
-                            needsEntitlementPatching = false;
-                            break;
-                        }
-                        section++; /* beware, pointer arithmetic */
-                    }
-                    
-                    uintptr_t space_remaining = segment->vmaddr + segment->vmsize - section->addr + section->size;
-                    
-                    
-                    if (!([entitlementsData length] + sizeof(struct section_64) * 2 < space_remaining)) {
-                        log_error("we don't have enoug padding to insert the sim entitlements\n");
-                        exit(1);
-                    }
-                    
-//                    segment->vmsize += [entitlementsData length];
-//                    segment->
-                    segment->cmdsize += (sizeof(struct section_64) * 2);
-                    segment->nsects += 2;
-                    header->sizeofcmds += (sizeof(struct section_64) * 2) ;
-                    NSMutableData *replacedHeader = [NSMutableData dataWithBytes:data.bytes length:((uintptr_t)section - (uintptr_t)header)];
-                    
-                    
-                    struct section_64 entsect = {
-                        .sectname = "__entitlements",    /* name of this section */
-                        .segname = "__TEXT",    /* segment this section goes in */
-                        .addr =  section[-2].addr + section[-2].size, /*section->addr + section->size + (sizeof(struct section_64) * 2),         memory address of this section */
-                        .size =  entitlementsData.length,     /* size in bytes of this section */
-                        .offset = 0, //sizeof(struct mach_header_64) + header->sizeofcmds,         /* file offset of this section */
-                        .align = 0,         /* section alignment (power of 2) */
-                        .reloff = 0,         /* file offset of relocation entries */
-                        .nreloc = 0,         /* number of relocation entries */
-                        .flags = 0,         /* flags (section type and attributes)*/
-                        .reserved1 = 0,     /* reserved (for offset or index) */
-                        .reserved2 = 0,     /* reserved (for count or sizeof) */
-                        .reserved3 = 0,     /* reserved */
-                    };
-                    [replacedHeader appendBytes:&entsect length:sizeof(entsect)];
-                    
-                    struct section_64 der_entsect = {
-                        .sectname = "__ent_der",    /* name of this section */
-                        .segname = "__TEXT",    /* segment this section goes in */
-//                        .addr =  section[-2].addr + section[-2].size, /*section->addr + section->size + (sizeof(struct section_64) * 2),         memory address of this section */
-                        .size =  0,     /* size in bytes of this section */
-                        .offset = 0, //sizeof(struct mach_header_64) + header->sizeofcmds,         /* file offset of this section */
-                        .align = 0,         /* section alignment (power of 2) */
-                        .reloff = 0,         /* file offset of relocation entries */
-                        .nreloc = 0,         /* number of relocation entries */
-                        .flags = 0,         /* flags (section type and attributes)*/
-                        .reserved1 = 0,     /* reserved (for offset or index) */
-                        .reserved2 = 0,     /* reserved (for count or sizeof) */
-                        .reserved3 = 0,     /* reserved */
-                    };
-                    [replacedHeader appendBytes:&der_entsect length:sizeof(struct section_64)];
-                    
-//                    ReplaceIndexedCollectionItemHdl(/*<#Collection aCollection#>*/, <#SInt32 itemIndex#>, <#Handle itemData#>)
-                    
-//                    [replacedHeader appendBytes:(void*)((uintptr_t)cur + cur->cmdsize)  length: header->sizeofcmds - ((uintptr_t)section - (uintptr_t)header)];
-//                    [replacedHeader appendData:entitlementsData];
-                    
-//                    NSRange range = NSMakeRange(0, header->sizeofcmds - ((uintptr_t)&section[1] - (uintptr_t)header)  + sizeof(struct mach_header_64));
-                    NSRange range = NSMakeRange(0,  ((uintptr_t)section - (uintptr_t)header));
-                    [data replaceBytesInRange:range withBytes:replacedHeader.bytes length:replacedHeader.length];
-                    
-                }
+//        if (!strncmp(segment->segname, "__PAGEZERO", 16)) {
+//            struct segment_command_64 *segment = (void*)cur;
+//            segment->initprot = 5;
+//            segment->maxprot = 5;
+//        }
+        
+        if (shouldInsertDylib && i == header->ncmds - 1) {
+            struct my_dylib_command {
+                uint32_t    cmd;
+                uint32_t    cmdsize;    /* includes pathname string */
+                struct dylib    dylib;        /* the library identification */
+                char path[16];
+            } lc = {
+                .cmd = LC_LOAD_DYLIB,
+                .cmdsize = sizeof(struct my_dylib_command),
+                .dylib = {
+                    .name.offset = sizeof(struct dylib_command),
+                },
+                    .path = "/tmp/x.dylib"
+            };
+            
+            if (found_signature_lc) {
+                struct segment_command_64 sig_cmd = {};
+                memcpy(&sig_cmd, found_signature_lc, sizeof(sig_cmd));
+                memcpy(found_signature_lc, &lc, sizeof(lc));
+                memcpy((char*)found_signature_lc + sizeof(lc), &sig_cmd, sizeof(sig_cmd));
+            } else {
+                memcpy((char*)header + sizeof(struct mach_header_64) + header->ncmds, &lc, sizeof(lc));
             }
+            
+            header->sizeofcmds += sizeof(lc);
+            header->ncmds++;
+            break;
         }
+
+
+        
         
         if (cur->cmd == LC_BUILD_VERSION) {
+            log_out("found LC_BUILD_VERSION! patching....\n");
             struct build_version_command*build = (void*)cur;
             NSRange platform_range = NSMakeRange((uintptr_t)&build->platform - (uintptr_t)ptr, sizeof(build->platform));
             int32_t new_platform = (int)platform;
@@ -313,37 +278,32 @@ int main(int argc, const char * argv[]) {
             NSRange version_range = NSMakeRange((uintptr_t)&build->minos - (uintptr_t)ptr, sizeof(build->minos));
             struct version new_version = {(int)bugfix, (int)minor, (int)major};
             [data replaceBytesInRange:version_range withBytes:&new_version];
-            const char *platform_name = get_platform_str(build->platform);
-            
-            
-            NSString *resolvedString = nil;
-            if (getenv("INPLACE")) {
-                resolvedString = [NSString stringWithFormat:@"%@", file];
-            } else {
-               resolvedString = [NSString stringWithFormat:@"%@_%s", file, platform_name];
-            }
-            
-            if (!getenv("DRYRUN")) {
-                [data writeToFile:resolvedString atomically:YES];
-                if (getenv("ADHOC")) {
-                    log_out("ad hoc code signing file.... \n");
-                    int err = ad_hoc_codesign_file(resolvedString.UTF8String);
-                    if (err) {
-                        return err;
-                    }
-                }
-            } else {
-                log_out("[DRY RUN]");
-            }
-            
-            log_out("writting to file: %s\n", resolvedString.UTF8String);
-            
-            
-            exit(0);
         }
         
         cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
     }
+    
+    NSString *resolvedString = nil;
+    if (getenv("INPLACE")) {
+        resolvedString = [NSString stringWithFormat:@"%@", file];
+    } else {
+        const char *platform_name = get_platform_str((int)platform);
+        resolvedString = [NSString stringWithFormat:@"%@_%s", file, platform_name];
+    }
+    if (!getenv("DRYRUN")) {
+        [data writeToFile:resolvedString atomically:YES];
+        if (getenv("ADHOC")) {
+            log_out("ad hoc code signing file.... \n");
+            int err = ad_hoc_codesign_file(resolvedString.UTF8String);
+            if (err) {
+                return err;
+            }
+        }
+    } else {
+        log_out("[DRY RUN]");
+    }
+    
+    log_out("writting to file: %s\n", resolvedString.UTF8String);
     
     return 0;
 }
