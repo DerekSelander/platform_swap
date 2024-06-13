@@ -528,7 +528,7 @@ int main(int argc, const char * argv[]) {
     if (needsBuildVersionAddition) {
         log_out("creating LC_BUILD_VERSION at end....\n");
         struct version new_version = {(int)bugfix, (int)minor, (int)major};
-        struct version sdk = {(int)0, (int)0 (int)17};
+        struct version sdk = {(int)0, (int)0, (int)17};
         
         struct build_version_command build = {
             .cmd = LC_BUILD_VERSION,
