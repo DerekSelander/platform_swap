@@ -7,7 +7,7 @@
 #import <Foundation/Foundation.h>
 #import <mach-o/fat.h>
 #import <mach-o/loader.h>
-
+#import <ar.h>
 static int g_verbose = 0;
 
 #define log_out(S, ...)   fprintf(stdout, S, ##__VA_ARGS__);
@@ -51,8 +51,15 @@ static const char *get_platform_str(int platform) {
     return "unknown";
 }
 
-@interface NSData (ReplaceBytesInRange)
+// ar crap
+#define ARMAG    "!<arch>\n"    /* String that begins an archive file.  */
+//#define SARMAG    8        /* Size of that string.  */
 
+//#define ARFMAG    "`\n"        /* String in ar_fmag at end of each header.  */
+
+
+
+@interface NSData (ReplaceBytesInRange)
 @end
 
 static NSData* entitlements_data_for_file(const char *path) {
@@ -65,6 +72,7 @@ static NSData* entitlements_data_for_file(const char *path) {
     status = SecCodeCopySigningInformation(staticCodeRef, kSecCSDefaultFlags, &cfdict);
     NSDictionary *dict = (__bridge_transfer NSDictionary*)cfdict;
     
+  
     NSMutableData *data = [[NSMutableData alloc] initWithData:dict[@"entitlements"]];
     if (!data || data.length  == 0) {
         log_out("executable didn't have entitlements\n");
@@ -222,71 +230,29 @@ static void patchup_lc_offsets(struct mach_header_64 *header, uint32_t delta) {
     }
 }
 
-int main(int argc, const char * argv[]) {
-    char path[PATH_MAX] = {};
+static int patch_platform_for_macho(NSMutableData *data, int platform, int major, int minor, int bugfix, NSString *file, char *path, char *ptr, bool should_die_on_bad_header) {
     
+    
+    NSString * resolvedString = nil;
     bool needsNCmdsDec = false;
     bool needsNCmdsOffsetPatchups = false;
-    bool shouldInsertDylib = getenv("INJECT")  ? true : false;
+    bool shouldInsertDylib = getenv("INJECT") ? true : false;
     bool isMainExecutable = false;
+    struct mach_header_64 *header = (void*)ptr;
+    uintptr_t baseptr = (uintptr_t)data.mutableBytes;
+    uint32_t magic = header->magic;
     
-    
-    if (argc != 6 && argc != 2) {
-        log_error_and_die("platform_swap /path/to/file platform_num major minor bugfix,  built on: %s, %s\n\tEX. to convert MacOS M1 binary to iOS 10.3.1 -> platform_swap /tmp/afile 2 10 3 1      # See PLATFORM_* in <mach-o/loader.h>\n", __DATE__, __TIME__);
-    }
-    
-    if (realpath(argv[1], path) == NULL) {
-        log_error("error resolving %s", argv[1]);
-    }
-    NSString *file = [NSString stringWithUTF8String:path];
-    NSURL *fileURL = [NSURL fileURLWithPath:file];
-    
-    if (!fileURL) {
-        log_error_and_die("Can't find file %s\n", path);
-    }
-    
-    NSMutableData *data = [NSMutableData dataWithContentsOfFile:file];
-    char *ptr = (void*)data.bytes;
-    if (!ptr) {
-        log_error_and_die("couldn't open file %s\n", file.UTF8String);
-    }
-    int32_t *magic = (int32_t*)ptr;
-    
-    if (*magic != MH_MAGIC_64) {
-        if (*magic == FAT_CIGAM || *magic == FAT_MAGIC || *magic == FAT_MAGIC_64 || *magic == FAT_CIGAM_64) {
+    if (magic != MH_MAGIC_64) {
+        if (magic == FAT_CIGAM || magic == FAT_MAGIC || magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
             log_error("fat file. Use \"lipo -thin <ARCH> -o /tmp/new_file %s\" first\n", path);
         }
-        log_error_and_die("Invalid header file\n");
-    }
-    
-    struct mach_header_64 *header = (void*)ptr;
-    
-    
-    
-    if (argc == 2) {
-        struct load_command *cur = (void*)((uintptr_t)ptr + (uintptr_t)sizeof(struct mach_header_64));
-        for (int i = 0; i < header->ncmds; i++) {
-            if (cur->cmd == LC_BUILD_VERSION) {
-                struct build_version_command* build = (void*)cur;
-                struct version *v = (void*)&build->minos;
-                struct version *sdk = (void*)&build->sdk;
-                log_out("%s (%d) %d.%d.%d, built with sdk: %d.%d.%d\nplatform_swap %s %d %d %d %d\n", get_platform_str(build->platform), build->platform, v->max, v->min, v->fix, sdk->max, sdk->min, sdk->fix, path, build->platform, v->max, v->min
-                       , v->fix);
-            }
-            cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
+        if (should_die_on_bad_header) {
+            log_error_and_die("Invalid header file\n");
         }
+        return 1;
     }
     
-    long platform = strtol(argv[2], NULL, 10);
-    long major  = strtol(argv[3], NULL, 10);
-    long minor  = strtol(argv[4], NULL, 10);
-    long bugfix = strtol(argv[5], NULL, 10);
-    char * endOfHeader = header->sizeofcmds + ptr + sizeof(struct mach_header_64);
     struct segment_command_64 *linkedit_segment = NULL;
-    
-    
-
-
     struct load_command *cur = (void*)((uintptr_t)ptr + (uintptr_t)sizeof(struct mach_header_64));
     for (int i = 0; i < header->ncmds; i++) {
         
@@ -318,7 +284,7 @@ int main(int argc, const char * argv[]) {
         }
         cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
     }
-
+    
     cur = (void*)((uintptr_t)ptr + (uintptr_t)sizeof(struct mach_header_64));
     // only entitlements on executables, not libraries
     NSData *entitlementsData = (platform == PLATFORM_IOSSIMULATOR && isMainExecutable) ? entitlements_data_for_file(path) : nil;
@@ -331,12 +297,12 @@ int main(int argc, const char * argv[]) {
     }
     
     
-// This is kinda fugly but I want a safe amount of memory for the entitlements but don't want to mess other offsets up, so instead of inserting into potentially tightly packed RX mem, I'll just expand the intial RX memory borrowing from PAGEZERO
-//#define SAFE_PAGE 0x4000
+    // This is kinda fugly but I want a safe amount of memory for the entitlements but don't want to mess other offsets up, so instead of inserting into potentially tightly packed RX mem, I'll just expand the intial RX memory borrowing from PAGEZERO
+    //#define SAFE_PAGE 0x4000
 #define INSERTED_SECTION_COUNT 1
     bool needsBuildVersionAddition = true;
+    cur = (void*)((uintptr_t)ptr + (uintptr_t)sizeof(struct mach_header_64));
     for (int i = 0; i < header->ncmds; i++) {
-        
         // these are just annoying throw them out
         if (cur->cmd == LC_VERSION_MIN_TVOS || cur->cmd == LC_VERSION_MIN_MACOSX || cur->cmd == LC_VERSION_MIN_WATCHOS || cur->cmd == LC_VERSION_MIN_IPHONEOS) {
             struct version_min_command min = {
@@ -345,10 +311,9 @@ int main(int argc, const char * argv[]) {
                 .version = 0,
                 .sdk = 0,
             };
-            NSRange range = NSMakeRange((uintptr_t)cur - (uintptr_t)header, sizeof(struct version_min_command));
+            NSRange range = NSMakeRange((uintptr_t)cur - (uintptr_t)baseptr, sizeof(struct version_min_command));
             [data replaceBytesInRange:range withBytes:&min];
-            header = (void*)data.bytes;
-            log_out("found a patched out a LC_VERSION_MIN\n");
+            log_out("    patched out a LC_VERSION_MIN at offset 0x%08x\n", (uintptr_t)cur - baseptr);
         }
         
         // extract the entitlements that are codesigned, stick them into mach-o sections, then resign as adhoc
@@ -402,8 +367,8 @@ int main(int argc, const char * argv[]) {
                         header->sizeofcmds += (sizeof(struct section_64) * INSERTED_SECTION_COUNT);
                         
                         // get the data up to the next mach-o segment (yes, section here is actually pointing to a segment as it ran past its count)
-                        uintptr_t length = (uintptr_t)next_segment - (uintptr_t)header;
-                        NSMutableData *replacedHeader = [NSMutableData dataWithBytes:data.bytes length:length];
+                        uintptr_t length = (uintptr_t)next_segment - baseptr;
+                        NSMutableData *replacedHeader = [NSMutableData dataWithBytes:data.mutableBytes length:length];
                         
                         uintptr_t initial_length = data.length;
                         
@@ -422,33 +387,33 @@ int main(int argc, const char * argv[]) {
                             .reserved3 = 0,     /* reserved */
                         };
                         [replacedHeader appendBytes:&entsect length:sizeof(entsect)];
-    
-//                        struct section_64 entsectDer = {
-//                            .sectname = "__ents_der",    /* name of this section */
-//                            .segname = "__TEXT",    /* segment this section goes in */
-//                            //                        .addr =  first_sect->addr - entitlementsData.length,
-//                            //                        .addr =  data.length - (found_signature_lc ? found_signature_lc->datasize : 0),
-//                            .addr = 0,
-//                            //                        .addr =  section[-2].addr + section[-2].size, /*section->addr + section->size + (sizeof(struct section_64) * 2),         memory address of this section */
-//                            .size = 0,
-//                            //                        .size =  entitlementsData.length,     /* size in bytes of this section */
-//                            .offset = (uint32_t)data.length,
-//                            .align = 0,         /* section alignment (power of 2) */
-//                            .reloff = 0,         /* file offset of relocation entries */
-//                            .nreloc = 0,         /* number of relocation entries */
-//                            .flags = 0,         /* flags (section type and attributes)*/
-//                            .reserved1 = 0,     /* reserved (for offset or index) */
-//                            .reserved2 = 0,     /* reserved (for count or sizeof) */
-//                            .reserved3 = 0,     /* reserved */
-//                        };
-//                        [replacedHeader appendBytes:&entsectDer length:sizeof(entsectDer)];
                         
-                        [replacedHeader appendBytes:&((char*)data.bytes)[length] length:header->sizeofcmds - length + sizeof(struct mach_header_64)];
+                        //                        struct section_64 entsectDer = {
+                        //                            .sectname = "__ents_der",    /* name of this section */
+                        //                            .segname = "__TEXT",    /* segment this section goes in */
+                        //                            //                        .addr =  first_sect->addr - entitlementsData.length,
+                        //                            //                        .addr =  data.length - (found_signature_lc ? found_signature_lc->datasize : 0),
+                        //                            .addr = 0,
+                        //                            //                        .addr =  section[-2].addr + section[-2].size, /*section->addr + section->size + (sizeof(struct section_64) * 2),         memory address of this section */
+                        //                            .size = 0,
+                        //                            //                        .size =  entitlementsData.length,     /* size in bytes of this section */
+                        //                            .offset = (uint32_t)data.length,
+                        //                            .align = 0,         /* section alignment (power of 2) */
+                        //                            .reloff = 0,         /* file offset of relocation entries */
+                        //                            .nreloc = 0,         /* number of relocation entries */
+                        //                            .flags = 0,         /* flags (section type and attributes)*/
+                        //                            .reserved1 = 0,     /* reserved (for offset or index) */
+                        //                            .reserved2 = 0,     /* reserved (for count or sizeof) */
+                        //                            .reserved3 = 0,     /* reserved */
+                        //                        };
+                        //                        [replacedHeader appendBytes:&entsectDer length:sizeof(entsectDer)];
+                        
+                        [replacedHeader appendBytes:&((char*)data.mutableBytes)[length] length:header->sizeofcmds - length + sizeof(struct mach_header_64)];
                         
                         //                    ReplaceIndexedCollectionItemHdl(/*<#Collection aCollection#>*/, <#SInt32 itemIndex#>, <#Handle itemData#>)
                         
                         //                    [replacedHeader appendBytes:(void*)((uintptr_t)cur + cur->cmdsize)  length: header->sizeofcmds - ((uintptr_t)section - (uintptr_t)header)];
-//                        [replacedHeader appendData:entitlementsData];
+                        //                        [replacedHeader appendData:entitlementsData];
                         
                         //                    NSRange range = NSMakeRange(0, header->sizeofcmds - ((uintptr_t)&section[1] - (uintptr_t)header)  + sizeof(struct mach_header_64));
                         
@@ -460,7 +425,7 @@ int main(int argc, const char * argv[]) {
                     [data appendData:entitlementsData];
                     
                     // we need to regen the header after an NSMutableData mutation
-                    header = (void*)data.bytes;
+//                    header = (void*)data.bytes;
                     
                     // we final patch, now that we know the size, tell the entitlements section where the data will be
                     
@@ -469,55 +434,54 @@ int main(int argc, const char * argv[]) {
         }
         
         
-//        if (!strncmp(segment->segname, "__PAGEZERO", 16)) {
-//            struct segment_command_64 *segment = (void*)cur;
-//            segment->initprot = 5;
-//            segment->maxprot = 5;
-//        }
+        //        if (!strncmp(segment->segname, "__PAGEZERO", 16)) {
+        //            struct segment_command_64 *segment = (void*)cur;
+        //            segment->initprot = 5;
+        //            segment->maxprot = 5;
+        //        }
         
-//        if (shouldInsertDylib && i == header->ncmds - 1) {
-//            struct my_dylib_command {
-//                uint32_t    cmd;
-//                uint32_t    cmdsize;    /* includes pathname string */
-//                struct dylib    dylib;        /* the library identification */
-//                char path[16];
-//            } lc = {
-//                .cmd = LC_LOAD_DYLIB,
-//                .cmdsize = sizeof(struct my_dylib_command),
-//                .dylib = {
-//                    .name.offset = sizeof(struct dylib_command),
-//                },
-//                    .path = "/tmp/x.dylib"
-//            };
-//            
-//            if (found_signature_lc) {
-//                struct segment_command_64 sig_cmd = {};
-//                memcpy(&sig_cmd, found_signature_lc, sizeof(sig_cmd));
-//                memcpy(found_signature_lc, &lc, sizeof(lc));
-//                memcpy((char*)found_signature_lc + sizeof(lc), &sig_cmd, sizeof(sig_cmd));
-//            } else {
-//                memcpy((char*)header + sizeof(struct mach_header_64) + header->ncmds, &lc, sizeof(lc));
-//            }
-//            
-//            header->sizeofcmds += sizeof(lc);
-//            header->ncmds++;
-//            break;
-//        }
-
-
+        //        if (shouldInsertDylib && i == header->ncmds - 1) {
+        //            struct my_dylib_command {
+        //                uint32_t    cmd;
+        //                uint32_t    cmdsize;    /* includes pathname string */
+        //                struct dylib    dylib;        /* the library identification */
+        //                char path[16];
+        //            } lc = {
+        //                .cmd = LC_LOAD_DYLIB,
+        //                .cmdsize = sizeof(struct my_dylib_command),
+        //                .dylib = {
+        //                    .name.offset = sizeof(struct dylib_command),
+        //                },
+        //                    .path = "/tmp/x.dylib"
+        //            };
+        //            
+        //            if (found_signature_lc) {
+        //                struct segment_command_64 sig_cmd = {};
+        //                memcpy(&sig_cmd, found_signature_lc, sizeof(sig_cmd));
+        //                memcpy(found_signature_lc, &lc, sizeof(lc));
+        //                memcpy((char*)found_signature_lc + sizeof(lc), &sig_cmd, sizeof(sig_cmd));
+        //            } else {
+        //                memcpy((char*)header + sizeof(struct mach_header_64) + header->ncmds, &lc, sizeof(lc));
+        //            }
+        //            
+        //            header->sizeofcmds += sizeof(lc);
+        //            header->ncmds++;
+        //            break;
+        //        }
+        
+        
         
         // patch the version to the proper platform
         if (cur->cmd == LC_BUILD_VERSION) {
-            log_out("found LC_BUILD_VERSION! patching....\n");
-            struct build_version_command*build = (void*)cur;
-            NSRange platform_range = NSMakeRange((uintptr_t)&build->platform - (uintptr_t)ptr, sizeof(build->platform));
+            struct build_version_command *build = (void*)cur;
+            log_out("    found LC_BUILD_VERSION at offset: 0x%08x! patching....\n", (uintptr_t)&build->platform - baseptr);
+            NSRange platform_range = NSMakeRange((uintptr_t)&build->platform - (uintptr_t)baseptr, sizeof(build->platform));
             int32_t new_platform = (int)platform;
             [data replaceBytesInRange:platform_range withBytes:&new_platform];
             
-            NSRange version_range = NSMakeRange((uintptr_t)&build->minos - (uintptr_t)ptr, sizeof(build->minos));
+            NSRange version_range = NSMakeRange((uintptr_t)&build->minos - (uintptr_t)baseptr, sizeof(build->minos));
             struct version new_version = {(int)bugfix, (int)minor, (int)major};
             [data replaceBytesInRange:version_range withBytes:&new_version];
-            header = (void*)data.bytes;
             needsBuildVersionAddition = false;
         }
         
@@ -526,7 +490,7 @@ int main(int argc, const char * argv[]) {
     
     // add an LC_BUILD_VERSION if there was none
     if (needsBuildVersionAddition) {
-        log_out("creating LC_BUILD_VERSION at end....\n");
+        log_out("    creating LC_BUILD_VERSION at end....\n");
         struct version new_version = {(int)bugfix, (int)minor, (int)major};
         struct version sdk = {(int)0, (int)0, (int)17};
         
@@ -538,29 +502,110 @@ int main(int argc, const char * argv[]) {
             .sdk = *(uint32_t*)&sdk,
             .ntools = 0,
         };
-        NSRange range = NSMakeRange((uintptr_t)cur - (uintptr_t)ptr, sizeof(struct build_version_command));
+        NSRange range = NSMakeRange((uintptr_t)cur - (uintptr_t)baseptr, sizeof(struct build_version_command));
         
         [data replaceBytesInRange:range withBytes:&build];
-        header = (void*)data.bytes;
         header->ncmds++;
         header->sizeofcmds += sizeof(struct build_version_command);
     }
     
-//    // set when we stripped out the signature
-//    if (needsNCmdsDec) {
-//        header = (void*)data.bytes;
-//        header->ncmds--;
-//    }
+    //    // set when we stripped out the signature
+    //    if (needsNCmdsDec) {
+    //        header->ncmds--;
+    //    }
     
     if (needsNCmdsOffsetPatchups) {
-//        patchup_lc_offsets((void*)data.bytes, sizeof(struct section_64) * INSERTED_SECTION_COUNT);
+        //        patchup_lc_offsets((void*)data.bytes, sizeof(struct section_64) * INSERTED_SECTION_COUNT);
     }
     
+
+ 
+    return 0;
+}
+
+static void print_platform(char *path, char *ptr) {
+    struct load_command *cur = (void*)((uintptr_t)ptr + (uintptr_t)sizeof(struct mach_header_64));
+    struct mach_header_64 *header = (void*)ptr;
+    for (int i = 0; i < header->ncmds; i++) {
+        if (cur->cmd == LC_BUILD_VERSION) {
+            struct build_version_command* build = (void*)cur;
+            struct version *v = (void*)&build->minos;
+            struct version *sdk = (void*)&build->sdk;
+            log_out("%s (%d) %d.%d.%d, built with sdk: %d.%d.%d\nplatform_swap %s %d %d %d %d\n", get_platform_str(build->platform), build->platform, v->max, v->min, v->fix, sdk->max, sdk->min, sdk->fix, path, build->platform, v->max, v->min
+                    , v->fix);
+        }
+        cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
+    }
+}
+
+int main(int argc, const char * argv[]) {
+    char path[PATH_MAX] = {};
+    if (argc != 6 && argc != 2) {
+        log_error_and_die("platform_swap /path/to/file platform_num major minor bugfix,  built on: %s, %s\n\tEX. to convert MacOS M1 binary to iOS 10.3.1 -> platform_swap /tmp/afile 2 10 3 1      # See PLATFORM_* in <mach-o/loader.h>\n", __DATE__, __TIME__);
+    }
+    
+    if (realpath(argv[1], path) == NULL) {
+        log_error("error resolving %s", argv[1]);
+    }
+    NSString *file = [NSString stringWithUTF8String:path];
+    NSURL *fileURL = [NSURL fileURLWithPath:file];
+    
+    if (!fileURL) {
+        log_error_and_die("Can't find file %s\n", path);
+    }
+    
+    NSMutableData *data = [NSMutableData dataWithContentsOfFile:file];
+    uintptr_t baseptr = (uintptr_t)data.mutableBytes;
+    uintptr_t length = data.length;
+    uintptr_t ptr = baseptr;
+    if (!ptr) {
+        log_error_and_die("couldn't open file %s\n", file.UTF8String);
+    }
+    
+    if (argc == 2) {
+        print_platform(path, (void*)ptr);
+        return 0;
+    }
+    
+    
+    int platform = (int)strtol(argv[2], NULL, 10);
+    int major  = (int)strtol(argv[3], NULL, 10);
+    int minor  = (int)strtol(argv[4], NULL, 10);
+    int bugfix = (int)strtol(argv[5], NULL, 10);
+    const char *platform_name = get_platform_str((int)platform);
+    log_out("platform swapping \"%s\" to %s %d.%d.%d \n", [file UTF8String], platform_name, major, minor, bugfix);
+    
+    if (strncmp((char*)ptr, ARMAG, SARMAG) == 0) {
+        ptr += SARMAG;
+        log_out("inspecting a static library...\n");
+        do {
+            struct ar_hdr *arh = (void*)ptr;
+            assert(strncmp(arh->ar_fmag, ARFMAG, strlen(ARFMAG)) == 0);
+            
+            int extra_length = 0;
+            char name[PATH_MAX];
+            if (strncmp(arh->ar_name, AR_EFMT1, strlen(AR_EFMT1)) == 0) {
+                extra_length = (int)strtol(&arh->ar_name[strlen(AR_EFMT1)], NULL, 10);
+                strncpy(name, (char*)(ptr + sizeof(struct ar_hdr)), extra_length);
+            } else {
+                strncpy(name, arh->ar_name, sizeof(arh->ar_name));
+            }
+            
+            struct mach_header_64 *potential_header = (void*)(ptr + extra_length + sizeof(struct ar_hdr));
+            log_out("- inspecting %s... at offset +0x%08lx, size: 0x%08lx \n", name,
+                             (uintptr_t)potential_header - (uintptr_t)baseptr,
+                                            strtol(arh->ar_size, NULL, 10));
+            patch_platform_for_macho(data, platform, major, minor, bugfix, file, path, (void*)potential_header, false);
+            ptr += strtol(arh->ar_size, NULL, 10) + sizeof(struct ar_hdr);
+        } while (ptr - baseptr < length);
+    } else {
+        patch_platform_for_macho(data, platform, major, minor, bugfix, file, path, (void*)ptr, true);
+    }
+ 
     NSString *resolvedString = nil;
     if (getenv("INPLACE")) {
         resolvedString = [NSString stringWithFormat:@"%@", file];
     } else {
-        const char *platform_name = get_platform_str((int)platform);
         resolvedString = [NSString stringWithFormat:@"%@_%s", file, platform_name];
     }
     if (!getenv("DRYRUN")) {
@@ -572,11 +617,10 @@ int main(int argc, const char * argv[]) {
                 return err;
             }
         }
+        log_out("writing file to: \"%s\"\n", resolvedString.UTF8String);
     } else {
         log_out("[DRY RUN]");
     }
-    
-    log_out("writting to file: %s\n", resolvedString.UTF8String);
     
     return 0;
 }
