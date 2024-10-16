@@ -609,7 +609,11 @@ int main(int argc, const char * argv[]) {
         resolvedString = [NSString stringWithFormat:@"%@_%s", file, platform_name];
     }
     if (!getenv("DRYRUN")) {
-        [data writeToFile:resolvedString atomically:YES];
+        if ([data writeToFile:resolvedString atomically:YES]) {
+            log_out("writing file to: \"%s\"\n", resolvedString.UTF8String);
+        } else {
+            log_error("Failed to write to file: \"%s\"\n", resolvedString.UTF8String);
+        }
         if (getenv("ADHOC")) {
             log_out("ad hoc code signing file.... \n");
             int err = ad_hoc_codesign_file(resolvedString.UTF8String, nil);
@@ -617,7 +621,6 @@ int main(int argc, const char * argv[]) {
                 return err;
             }
         }
-        log_out("writing file to: \"%s\"\n", resolvedString.UTF8String);
     } else {
         log_out("[DRY RUN]");
     }
