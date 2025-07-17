@@ -81,7 +81,29 @@ static NSData* entitlements_data_for_file(const char *path) {
     NSRange range = NSMakeRange(0, data.length);
     // strip out the 0xfade7171 + uint32_length header
     [data replaceBytesInRange:range withBytes:data.bytes + (sizeof(uint32_t)*2) length:data.length - (sizeof(uint32_t)*2)];
-    return data;
+    
+    NSError *error = nil;
+    NSDictionary *entitlements = [NSPropertyListSerialization propertyListWithData:data
+                                                                           options:0
+                                                                            format:nil
+                                                                             error:&error];
+    if (error) {
+        log_error("entitlements err: %s\n", error.localizedDescription.UTF8String);
+        return nil;
+    }
+    NSMutableDictionary *mutableEntitlements = [NSMutableDictionary dictionaryWithDictionary:entitlements];
+    [mutableEntitlements setObject:@YES forKey:@"get-task-allow"];
+    
+    NSData *xmlData = [NSPropertyListSerialization dataWithPropertyList:mutableEntitlements
+                                                                 format:NSPropertyListXMLFormat_v1_0
+                                                                options:0
+                                                                  error:&error];
+    
+    if (error) {
+        log_error("entitlements err: %s\n", error.localizedDescription.UTF8String);
+        return nil;
+    }
+    return xmlData;
 }
 //
 //void get_entitlements(char * path) {
