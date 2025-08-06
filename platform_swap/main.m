@@ -252,7 +252,7 @@ static void patchup_lc_offsets(struct mach_header_64 *header, uint32_t delta) {
     }
 }
 
-static int patch_platform_for_macho(NSMutableData *data, int platform, int major, int minor, int bugfix, NSString *file, char *path, char *ptr, bool should_die_on_bad_header) {
+static int patch_platform_for_macho(NSMutableData *data, int platform, int major, int minor, int bugfix, int filetype, NSString *file, char *path, char *ptr, bool should_die_on_bad_header) {
     
     
     NSString * resolvedString = nil;
@@ -540,6 +540,9 @@ static int patch_platform_for_macho(NSMutableData *data, int platform, int major
         //        patchup_lc_offsets((void*)data.bytes, sizeof(struct section_64) * INSERTED_SECTION_COUNT);
     }
     
+    if (filetype) {
+        header->filetype = filetype;
+    }
 
  
     return 0;
@@ -553,7 +556,7 @@ static void print_platform(char *path, char *ptr) {
             struct build_version_command* build = (void*)cur;
             struct version *v = (void*)&build->minos;
             struct version *sdk = (void*)&build->sdk;
-            log_out("%s (%d) %d.%d.%d, built with sdk: %d.%d.%d\nplatform_swap %s %d %d %d %d\n", get_platform_str(build->platform), build->platform, v->max, v->min, v->fix, sdk->max, sdk->min, sdk->fix, path, build->platform, v->max, v->min
+            log_out("%s (%d) %d.%d.%d type: %d, built with sdk: %d.%d.%d\nplatform_swap %s %d %d %d %d\n", get_platform_str(build->platform), build->platform, v->max, v->min, v->fix, header->filetype, sdk->max, sdk->min, sdk->fix, path, build->platform, v->max, v->min
                     , v->fix);
         }
         cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
@@ -562,8 +565,13 @@ static void print_platform(char *path, char *ptr) {
 
 int main(int argc, const char * argv[]) {
     char path[PATH_MAX] = {};
-    if (argc != 6 && argc != 2) {
-        log_error_and_die("platform_swap /path/to/file platform_num major minor bugfix,  built on: %s, %s\n\tEX. to convert MacOS M1 binary to iOS 10.3.1 -> platform_swap /tmp/afile 2 10 3 1      # See PLATFORM_* in <mach-o/loader.h>\n", __DATE__, __TIME__);
+    if (argc != 7 && argc != 6 && argc != 2) {
+        fprintf(stderr, "\nplatform_swap /path/to/file platform_num major minor bugfix [filetype],  built on: %s, %s\n\n\tEX. to convert MacOS M1 binary to iOS 10.3.1 -> platform_swap /tmp/afile 2 10 3 1      # See PLATFORM_* in <mach-o/loader.h>\n\tYou can also specify the MH_* filetype after all other arguments if you just want to change the filetype\n", __DATE__, __TIME__);
+        fprintf(stderr, "ENV VARS:\n");
+        fprintf(stderr, "\tDRYRUN=1, initial test, don't change anything\n");
+        fprintf(stderr, "\tENTITLEMENTS=/path/to/entitlements/file, path used to resign entitlements\n");
+        fprintf(stderr, "\tINPLACE=1, instead of creating a new file, modifies existing in place\n");
+        exit(1);
     }
     
     if (realpath(argv[1], path) == NULL) {
@@ -594,8 +602,9 @@ int main(int argc, const char * argv[]) {
     int major  = (int)strtol(argv[3], NULL, 10);
     int minor  = (int)strtol(argv[4], NULL, 10);
     int bugfix = (int)strtol(argv[5], NULL, 10);
+    int filetype = argc == 7 ?  (int)strtol(argv[5], NULL, 10) : 0;
     const char *platform_name = get_platform_str((int)platform);
-    log_out("platform swapping \"%s\" to %s %d.%d.%d \n", [file UTF8String], platform_name, major, minor, bugfix);
+    log_out("platform swapping \"%s\" to %s %d.%d.%d %d \n", [file UTF8String], platform_name, major, minor, bugfix, filetype);
     
     if (strncmp((char*)ptr, ARMAG, SARMAG) == 0) {
         ptr += SARMAG;
@@ -617,11 +626,11 @@ int main(int argc, const char * argv[]) {
             log_out("- inspecting %s... at offset +0x%08lx, size: 0x%08lx \n", name,
                              (uintptr_t)potential_header - (uintptr_t)baseptr,
                                             strtol(arh->ar_size, NULL, 10));
-            patch_platform_for_macho(data, platform, major, minor, bugfix, file, path, (void*)potential_header, false);
+            patch_platform_for_macho(data, platform, major, minor, bugfix, filetype, file, path, (void*)potential_header, false);
             ptr += strtol(arh->ar_size, NULL, 10) + sizeof(struct ar_hdr);
         } while (ptr - baseptr < length);
     } else {
-        patch_platform_for_macho(data, platform, major, minor, bugfix, file, path, (void*)ptr, true);
+        patch_platform_for_macho(data, platform, major, minor, bugfix, filetype, file, path, (void*)ptr, true);
     }
  
     NSString *resolvedString = nil;
