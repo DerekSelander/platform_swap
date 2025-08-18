@@ -563,10 +563,27 @@ static void print_platform(char *path, char *ptr) {
     }
 }
 
+static void populate_version(char *path, char* ptr,  int *major , int *minor, int *bugfix, int *filetype) {
+    struct load_command *cur = (void*)((uintptr_t)ptr + (uintptr_t)sizeof(struct mach_header_64));
+    struct mach_header_64 *header = (void*)ptr;
+    for (int i = 0; i < header->ncmds; i++) {
+        if (cur->cmd == LC_BUILD_VERSION) {
+            struct build_version_command* build = (void*)cur;
+            struct version *v = (void*)&build->minos;
+            *major = v->max;
+            *minor = v->min;
+            *bugfix = v->fix;
+            *filetype = header->filetype;
+            return;
+        }
+        cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
+    }
+}
+
 int main(int argc, const char * argv[]) {
     char path[PATH_MAX] = {};
-    if (argc != 7 && argc != 6 && argc != 2) {
-        fprintf(stderr, "\nplatform_swap /path/to/file platform_num major minor bugfix [filetype],  built on: %s, %s\n\n\tEX. to convert MacOS M1 binary to iOS 10.3.1 -> platform_swap /tmp/afile 2 10 3 1      # See PLATFORM_* in <mach-o/loader.h>\n\tYou can also specify the MH_* filetype after all other arguments if you just want to change the filetype\n", __DATE__, __TIME__);
+    if (argc != 7 && argc != 6 && argc != 2 && argc != 3) {
+        fprintf(stderr, "\nplatform_swap /path/to/file platform_num [major minor bugfix] [filetype],  built on: %s, %s\n\n\tEX. to convert MacOS M1 binary to iOS 10.3.1 -> platform_swap /tmp/afile 2 10 3 1      # See PLATFORM_* in <mach-o/loader.h>\n\tYou can also specify the MH_* filetype after all other arguments if you just want to change the filetype\n", __DATE__, __TIME__);
         fprintf(stderr, "ENV VARS:\n");
         fprintf(stderr, "\tDRYRUN=1, initial test, don't change anything\n");
         fprintf(stderr, "\tENTITLEMENTS=/path/to/entitlements/file, path used to resign entitlements\n");
@@ -588,6 +605,11 @@ int main(int argc, const char * argv[]) {
     uintptr_t baseptr = (uintptr_t)data.mutableBytes;
     uintptr_t length = data.length;
     uintptr_t ptr = baseptr;
+    
+    if (*(uint32_t*)baseptr != MH_MAGIC_64 && *(uint32_t*)baseptr != FAT_MAGIC &&  *(uint32_t*)baseptr  != FAT_CIGAM) {
+        log_out("\"%s\" is not a mach-o, exiting\n", path);
+        return 1;
+    }
     if (!ptr) {
         log_error_and_die("couldn't open file %s\n", file.UTF8String);
     }
@@ -597,12 +619,23 @@ int main(int argc, const char * argv[]) {
         return 0;
     }
     
+    int platform = 0;
+    int major = 0;
+    int minor = 0;
+    int bugfix = 0;
+    int filetype = 0 ;
     
-    int platform = (int)strtol(argv[2], NULL, 10);
-    int major  = (int)strtol(argv[3], NULL, 10);
-    int minor  = (int)strtol(argv[4], NULL, 10);
-    int bugfix = (int)strtol(argv[5], NULL, 10);
-    int filetype = argc == 7 ?  (int)strtol(argv[5], NULL, 10) : 0;
+    // we're swapping a platform w/o patching the major minor bug components
+    platform = (int)strtol(argv[2], NULL, 10);
+    if (argc == 3) {
+        populate_version(path, (void*)ptr, &major, &minor, &bugfix, &filetype);
+//        log_out("using the same versioning v%d.%d.%d filetype: %d\n", major, minor, bugfix, filetype);
+    } else {
+        major  = (int)strtol(argv[3], NULL, 10);
+        minor  = (int)strtol(argv[4], NULL, 10);
+        bugfix = (int)strtol(argv[5], NULL, 10);
+    }
+    filetype = argc == 7 ?  (int)strtol(argv[5], NULL, 10) : filetype;
     const char *platform_name = get_platform_str((int)platform);
     log_out("platform swapping \"%s\" to %s %d.%d.%d %d \n", [file UTF8String], platform_name, major, minor, bugfix, filetype);
     
