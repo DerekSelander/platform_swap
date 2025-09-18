@@ -1,7 +1,7 @@
 //
 //  main.m
 //  platform_swap @LOLgrep
-//  clang -o /tmp/platform_swap /path/to/platform_swap.m -framework Foundation
+//  clang -o /tmp/platform_swap /path/to/platform_swap.m -framework Foundation -framework Security
 
 #include <Security/Security.h>
 #import <Foundation/Foundation.h>
