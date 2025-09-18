@@ -8,6 +8,7 @@
 #import <mach-o/fat.h>
 #import <mach-o/loader.h>
 #import <ar.h>
+#include <libgen.h>
 static int g_verbose = 0;
 
 #define log_out(S, ...)   fprintf(stdout, S, ##__VA_ARGS__);
@@ -260,6 +261,8 @@ static int patch_platform_for_macho(NSMutableData *data, int platform, int major
     bool needsNCmdsOffsetPatchups = false;
     bool shouldInsertDylib = getenv("INJECT") ? true : false;
     bool isMainExecutable = false;
+    bool needsDylibID = filetype == MH_DYLIB;
+    bool hasDylibID = false;
     struct mach_header_64 *header = (void*)ptr;
     uintptr_t baseptr = (uintptr_t)data.mutableBytes;
     uint32_t magic = header->magic;
@@ -304,6 +307,10 @@ static int patch_platform_for_macho(NSMutableData *data, int platform, int major
                 linkedit_segment = segment;
             }
         }
+        
+        if (cur->cmd == LC_ID_DYLIB) {
+            hasDylibID = true;
+        }
         cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
     }
     
@@ -335,7 +342,7 @@ static int patch_platform_for_macho(NSMutableData *data, int platform, int major
             };
             NSRange range = NSMakeRange((uintptr_t)cur - (uintptr_t)baseptr, sizeof(struct version_min_command));
             [data replaceBytesInRange:range withBytes:&min];
-            log_out("    patched out a LC_VERSION_MIN at offset 0x%08x\n", (uintptr_t)cur - baseptr);
+            log_out("    patched out a LC_VERSION_MIN at offset 0x%08lx\n", (uintptr_t)cur - (uintptr_t)baseptr);
         }
         
         // extract the entitlements that are codesigned, stick them into mach-o sections, then resign as adhoc
@@ -531,6 +538,36 @@ static int patch_platform_for_macho(NSMutableData *data, int platform, int major
         header->sizeofcmds += sizeof(struct build_version_command);
     }
     
+    if (needsDylibID && !hasDylibID) {
+        
+        char buffer[100] = {};
+        snprintf(buffer, 100, "@rpath/%s.dylib", basename((char*)file.UTF8String));
+        size_t len = sizeof(struct dylib_command) + strlen(buffer) + 1;
+        // these mh lc need to be multiples of 4 else linking fails
+        len += (4 - (len % 4));
+        log_out("    creating LC_BUILD_VERSION at end.... RPATH -> \"%s\"\n", buffer);
+        
+        struct dylib_lc {
+            struct dylib_command d;
+            char dyid[100];
+        } dylibid = {
+                .d.cmd = LC_ID_DYLIB,
+                .d.cmdsize = (uint32_t)len,
+                .d.dylib = {
+                    .name.offset = sizeof(struct dylib_command),
+                },
+        };
+        strncpy(dylibid.dyid, buffer, 100);
+        
+        
+        
+        NSRange range = NSMakeRange((uintptr_t)cur - (uintptr_t)baseptr, len);
+        
+        [data replaceBytesInRange:range withBytes:&dylibid];
+        header->ncmds++;
+        header->sizeofcmds += len;
+    }
+    
     //    // set when we stripped out the signature
     //    if (needsNCmdsDec) {
     //        header->ncmds--;
@@ -570,10 +607,20 @@ static void populate_version(char *path, char* ptr,  int *major , int *minor, in
         if (cur->cmd == LC_BUILD_VERSION) {
             struct build_version_command* build = (void*)cur;
             struct version *v = (void*)&build->minos;
-            *major = v->max;
-            *minor = v->min;
-            *bugfix = v->fix;
-            *filetype = header->filetype;
+            if (major) {
+                *major = v->max;
+            }
+            if (minor) {
+                *minor = v->min;
+            }
+            
+            if (bugfix) {
+                *bugfix = v->fix;
+            }
+            
+            if (filetype) {
+                *filetype = header->filetype;
+            }
             return;
         }
         cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
@@ -624,18 +671,17 @@ int main(int argc, const char * argv[]) {
     int minor = 0;
     int bugfix = 0;
     int filetype = 0 ;
+    populate_version(path, (void*)ptr, &major, &minor, &bugfix, &filetype);
     
     // we're swapping a platform w/o patching the major minor bug components
     platform = (int)strtol(argv[2], NULL, 10);
-    if (argc == 3) {
-        populate_version(path, (void*)ptr, &major, &minor, &bugfix, &filetype);
-//        log_out("using the same versioning v%d.%d.%d filetype: %d\n", major, minor, bugfix, filetype);
-    } else {
+    if (argc != 3) { // assuming 6 or 7 arg format
         major  = (int)strtol(argv[3], NULL, 10);
         minor  = (int)strtol(argv[4], NULL, 10);
         bugfix = (int)strtol(argv[5], NULL, 10);
     }
-    filetype = argc == 7 ?  (int)strtol(argv[5], NULL, 10) : filetype;
+    
+    filetype = argc == 7 ?  (int)strtol(argv[6], NULL, 10) : filetype;
     const char *platform_name = get_platform_str((int)platform);
     log_out("platform swapping \"%s\" to %s %d.%d.%d %d \n", [file UTF8String], platform_name, major, minor, bugfix, filetype);
     
