@@ -24,6 +24,8 @@ struct version {
 
 static const char *get_platform_str(int platform) {
     switch (platform) {
+        case PLATFORM_UNKNOWN:
+            return "unknown";
         case PLATFORM_MACOS:
             return  "macos";
         case PLATFORM_IOS:
@@ -653,7 +655,7 @@ int main(int argc, const char * argv[]) {
     uintptr_t length = data.length;
     uintptr_t ptr = baseptr;
     
-    if (*(uint32_t*)baseptr != MH_MAGIC_64 && *(uint32_t*)baseptr != FAT_MAGIC &&  *(uint32_t*)baseptr  != FAT_CIGAM) {
+    if (*(uint32_t*)baseptr != MH_MAGIC_64 && *(uint32_t*)baseptr != FAT_MAGIC &&  *(uint32_t*)baseptr  != FAT_CIGAM && strstr((char*)baseptr, ARMAG) != (char*)baseptr) {
         log_out("\"%s\" is not a mach-o, exiting\n", path);
         return 1;
     }
@@ -671,7 +673,7 @@ int main(int argc, const char * argv[]) {
     int minor = 0;
     int bugfix = 0;
     int filetype = 0 ;
-    populate_version(path, (void*)ptr, &major, &minor, &bugfix, &filetype);
+
     
     // we're swapping a platform w/o patching the major minor bug components
     platform = (int)strtol(argv[2], NULL, 10);
@@ -709,6 +711,7 @@ int main(int argc, const char * argv[]) {
             ptr += strtol(arh->ar_size, NULL, 10) + sizeof(struct ar_hdr);
         } while (ptr - baseptr < length);
     } else {
+        populate_version(path, (void*)ptr, &major, &minor, &bugfix, &filetype);
         patch_platform_for_macho(data, platform, major, minor, bugfix, filetype, file, path, (void*)ptr, true);
     }
  
