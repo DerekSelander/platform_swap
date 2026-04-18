@@ -9,6 +9,7 @@
 #import <mach-o/loader.h>
 #import <ar.h>
 #include <libgen.h>
+#include <libkern/OSByteOrder.h>
 static int g_verbose = 0;
 
 #define log_out(S, ...)   fprintf(stdout, S, ##__VA_ARGS__);
@@ -629,6 +630,41 @@ static void populate_version(char *path, char* ptr,  int *major , int *minor, in
     }
 }
 
+// Handles a single slice: either a static library (archive of mach-o's) or a single mach-o.
+// `ptr` points at the start of the slice within `data`; `slice_size` is how many bytes the slice occupies.
+static int process_slice(NSMutableData *data, int platform, int major, int minor, int bugfix, int filetype, NSString *file, char *path, char *ptr, size_t slice_size, bool should_die_on_bad_header) {
+    uintptr_t baseptr = (uintptr_t)data.mutableBytes;
+
+    if (strncmp(ptr, ARMAG, SARMAG) == 0) {
+        log_out("inspecting a static library at offset 0x%08lx...\n", (uintptr_t)ptr - baseptr);
+        uintptr_t cur_ptr = (uintptr_t)ptr + SARMAG;
+        uintptr_t slice_end = (uintptr_t)ptr + slice_size;
+        do {
+            struct ar_hdr *arh = (void*)cur_ptr;
+            assert(strncmp(arh->ar_fmag, ARFMAG, strlen(ARFMAG)) == 0);
+
+            int extra_length = 0;
+            char name[PATH_MAX];
+            if (strncmp(arh->ar_name, AR_EFMT1, strlen(AR_EFMT1)) == 0) {
+                extra_length = (int)strtol(&arh->ar_name[strlen(AR_EFMT1)], NULL, 10);
+                strncpy(name, (char*)(cur_ptr + sizeof(struct ar_hdr)), extra_length);
+            } else {
+                strncpy(name, arh->ar_name, sizeof(arh->ar_name));
+            }
+
+            struct mach_header_64 *potential_header = (void*)(cur_ptr + extra_length + sizeof(struct ar_hdr));
+            log_out("- inspecting %s... at offset +0x%08lx, size: 0x%08lx \n", name,
+                    (uintptr_t)potential_header - baseptr,
+                    strtol(arh->ar_size, NULL, 10));
+            patch_platform_for_macho(data, platform, major, minor, bugfix, filetype, file, path, (void*)potential_header, false);
+            cur_ptr += strtol(arh->ar_size, NULL, 10) + sizeof(struct ar_hdr);
+        } while (cur_ptr < slice_end);
+        return 0;
+    }
+
+    return patch_platform_for_macho(data, platform, major, minor, bugfix, filetype, file, path, ptr, should_die_on_bad_header);
+}
+
 int main(int argc, const char * argv[]) {
     char path[PATH_MAX] = {};
     if (argc != 7 && argc != 6 && argc != 2 && argc != 3) {
@@ -655,7 +691,8 @@ int main(int argc, const char * argv[]) {
     uintptr_t length = data.length;
     uintptr_t ptr = baseptr;
     
-    if (*(uint32_t*)baseptr != MH_MAGIC_64 && *(uint32_t*)baseptr != FAT_MAGIC &&  *(uint32_t*)baseptr  != FAT_CIGAM && strstr((char*)baseptr, ARMAG) != (char*)baseptr) {
+    uint32_t base_magic = *(uint32_t*)baseptr;
+    if (base_magic != MH_MAGIC_64 && base_magic != FAT_MAGIC && base_magic != FAT_CIGAM && base_magic != FAT_MAGIC_64 && base_magic != FAT_CIGAM_64 && strstr((char*)baseptr, ARMAG) != (char*)baseptr) {
         log_out("\"%s\" is not a mach-o, exiting\n", path);
         return 1;
     }
@@ -687,32 +724,39 @@ int main(int argc, const char * argv[]) {
     const char *platform_name = get_platform_str((int)platform);
     log_out("platform swapping \"%s\" to %s %d.%d.%d %d \n", [file UTF8String], platform_name, major, minor, bugfix, filetype);
     
-    if (strncmp((char*)ptr, ARMAG, SARMAG) == 0) {
-        ptr += SARMAG;
-        log_out("inspecting a static library...\n");
-        do {
-            struct ar_hdr *arh = (void*)ptr;
-            assert(strncmp(arh->ar_fmag, ARFMAG, strlen(ARFMAG)) == 0);
-            
-            int extra_length = 0;
-            char name[PATH_MAX];
-            if (strncmp(arh->ar_name, AR_EFMT1, strlen(AR_EFMT1)) == 0) {
-                extra_length = (int)strtol(&arh->ar_name[strlen(AR_EFMT1)], NULL, 10);
-                strncpy(name, (char*)(ptr + sizeof(struct ar_hdr)), extra_length);
+    bool is_fat_64 = (base_magic == FAT_MAGIC_64 || base_magic == FAT_CIGAM_64);
+    bool is_fat_32 = (base_magic == FAT_MAGIC || base_magic == FAT_CIGAM);
+    if (is_fat_32 || is_fat_64) {
+        struct fat_header *fh = (struct fat_header*)baseptr;
+        uint32_t nfat = OSSwapBigToHostInt32(fh->nfat_arch);
+        log_out("inspecting FAT file with %u slices...\n", nfat);
+
+        for (uint32_t i = 0; i < nfat; i++) {
+            // re-read base each slice in case `data` was mutated (e.g. signature strip, entitlements append)
+            uintptr_t current_base = (uintptr_t)data.mutableBytes;
+            uint64_t slice_off = 0, slice_size = 0;
+            if (is_fat_64) {
+                struct fat_arch_64 *fa = &((struct fat_arch_64*)(current_base + sizeof(struct fat_header)))[i];
+                slice_off = OSSwapBigToHostInt64(fa->offset);
+                slice_size = OSSwapBigToHostInt64(fa->size);
             } else {
-                strncpy(name, arh->ar_name, sizeof(arh->ar_name));
+                struct fat_arch *fa = &((struct fat_arch*)(current_base + sizeof(struct fat_header)))[i];
+                slice_off = OSSwapBigToHostInt32(fa->offset);
+                slice_size = OSSwapBigToHostInt32(fa->size);
             }
-            
-            struct mach_header_64 *potential_header = (void*)(ptr + extra_length + sizeof(struct ar_hdr));
-            log_out("- inspecting %s... at offset +0x%08lx, size: 0x%08lx \n", name,
-                             (uintptr_t)potential_header - (uintptr_t)baseptr,
-                                            strtol(arh->ar_size, NULL, 10));
-            patch_platform_for_macho(data, platform, major, minor, bugfix, filetype, file, path, (void*)potential_header, false);
-            ptr += strtol(arh->ar_size, NULL, 10) + sizeof(struct ar_hdr);
-        } while (ptr - baseptr < length);
+            log_out("FAT slice %u: offset=0x%llx size=0x%llx\n", i, slice_off, slice_size);
+
+            char *slice_ptr = (char*)(current_base + slice_off);
+            if (i == 0 && argc == 3 && strncmp(slice_ptr, ARMAG, SARMAG) != 0) {
+                populate_version(path, slice_ptr, &major, &minor, &bugfix, &filetype);
+            }
+            process_slice(data, platform, major, minor, bugfix, filetype, file, path, slice_ptr, (size_t)slice_size, true);
+        }
     } else {
-        populate_version(path, (void*)ptr, &major, &minor, &bugfix, &filetype);
-        patch_platform_for_macho(data, platform, major, minor, bugfix, filetype, file, path, (void*)ptr, true);
+        if (strncmp((char*)ptr, ARMAG, SARMAG) != 0) {
+            populate_version(path, (void*)ptr, &major, &minor, &bugfix, &filetype);
+        }
+        process_slice(data, platform, major, minor, bugfix, filetype, file, path, (char*)ptr, (size_t)length, true);
     }
  
     NSString *resolvedString = nil;
