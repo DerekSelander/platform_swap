@@ -256,6 +256,18 @@ static void patchup_lc_offsets(struct mach_header_64 *header, uint32_t delta) {
     }
 }
 
+// Neutralize a load command in place: set cmd to 0 (unknown, no LC_REQ_DYLD bit → dyld/ld64
+// silently skip per <mach-o/loader.h>:270) and zero the payload while preserving cmdsize.
+// Nothing else moves, so file offsets in other LCs and the iteration pointer stay valid.
+static void nopify_load_command(NSMutableData *data, uintptr_t baseptr, struct load_command *cur) {
+    uintptr_t off = (uintptr_t)cur - baseptr;
+    uint32_t size = cur->cmdsize;
+    NSMutableData *zeros = [NSMutableData dataWithLength:size];
+    struct load_command stub = { .cmd = 0, .cmdsize = size };
+    memcpy(zeros.mutableBytes, &stub, sizeof(stub));
+    [data replaceBytesInRange:NSMakeRange(off, size) withBytes:zeros.bytes length:size];
+}
+
 static int patch_platform_for_macho(NSMutableData *data, int platform, int major, int minor, int bugfix, int filetype, NSString *file, char *path, char *ptr, bool should_die_on_bad_header) {
     
     
@@ -337,15 +349,8 @@ static int patch_platform_for_macho(NSMutableData *data, int platform, int major
     for (int i = 0; i < header->ncmds; i++) {
         // these are just annoying throw them out
         if (cur->cmd == LC_VERSION_MIN_TVOS || cur->cmd == LC_VERSION_MIN_MACOSX || cur->cmd == LC_VERSION_MIN_WATCHOS || cur->cmd == LC_VERSION_MIN_IPHONEOS) {
-            struct version_min_command min = {
-                .cmd = LC_RPATH,
-                .cmdsize = sizeof(struct version_min_command),
-                .version = 0,
-                .sdk = 0,
-            };
-            NSRange range = NSMakeRange((uintptr_t)cur - (uintptr_t)baseptr, sizeof(struct version_min_command));
-            [data replaceBytesInRange:range withBytes:&min];
-            log_out("    patched out a LC_VERSION_MIN at offset 0x%08lx\n", (uintptr_t)cur - (uintptr_t)baseptr);
+            log_out("    nop'd out a LC_VERSION_MIN at offset 0x%08lx\n", (uintptr_t)cur - (uintptr_t)baseptr);
+            nopify_load_command(data, baseptr, cur);
         }
         
         // extract the entitlements that are codesigned, stick them into mach-o sections, then resign as adhoc
@@ -503,25 +508,31 @@ static int patch_platform_for_macho(NSMutableData *data, int platform, int major
         
         
         
-        // patch the version to the proper platform
+        // patch the version to the proper platform, OR strip it entirely (STRIP=1)
+        // for universal static libraries
         if (cur->cmd == LC_BUILD_VERSION) {
-            struct build_version_command *build = (void*)cur;
-            log_out("    found LC_BUILD_VERSION at offset: 0x%08x! patching....\n", (uintptr_t)&build->platform - baseptr);
-            NSRange platform_range = NSMakeRange((uintptr_t)&build->platform - (uintptr_t)baseptr, sizeof(build->platform));
-            int32_t new_platform = (int)platform;
-            [data replaceBytesInRange:platform_range withBytes:&new_platform];
-            
-            NSRange version_range = NSMakeRange((uintptr_t)&build->minos - (uintptr_t)baseptr, sizeof(build->minos));
-            struct version new_version = {(int)bugfix, (int)minor, (int)major};
-            [data replaceBytesInRange:version_range withBytes:&new_version];
+            if (getenv("STRIP")) {
+                log_out("    stripping LC_BUILD_VERSION at offset 0x%08lx\n", (uintptr_t)cur - baseptr);
+                nopify_load_command(data, baseptr, cur);
+            } else {
+                struct build_version_command *build = (void*)cur;
+                log_out("    found LC_BUILD_VERSION at offset: 0x%08x! patching....\n", (uintptr_t)&build->platform - baseptr);
+                NSRange platform_range = NSMakeRange((uintptr_t)&build->platform - (uintptr_t)baseptr, sizeof(build->platform));
+                int32_t new_platform = (int)platform;
+                [data replaceBytesInRange:platform_range withBytes:&new_platform];
+
+                NSRange version_range = NSMakeRange((uintptr_t)&build->minos - (uintptr_t)baseptr, sizeof(build->minos));
+                struct version new_version = {(int)bugfix, (int)minor, (int)major};
+                [data replaceBytesInRange:version_range withBytes:&new_version];
+            }
             needsBuildVersionAddition = false;
         }
         
         cur = (void*)(cur->cmdsize  + (uintptr_t)cur);
     }
     
-    // add an LC_BUILD_VERSION if there was none
-    if (needsBuildVersionAddition) {
+    // add an LC_BUILD_VERSION if there was none (skip when stripping for universal output)
+    if (needsBuildVersionAddition && !getenv("STRIP")) {
         log_out("    creating LC_BUILD_VERSION at end....\n");
         struct version new_version = {(int)bugfix, (int)minor, (int)major};
         struct version sdk = {(int)0, (int)0, (int)17};
@@ -673,6 +684,7 @@ int main(int argc, const char * argv[]) {
         fprintf(stderr, "\tDRYRUN=1, initial test, don't change anything\n");
         fprintf(stderr, "\tENTITLEMENTS=/path/to/entitlements/file, path used to resign entitlements\n");
         fprintf(stderr, "\tINPLACE=1, instead of creating a new file, modifies existing in place\n");
+        fprintf(stderr, "\tSTRIP=1, nop out LC_BUILD_VERSION instead of patching it (makes a static lib universal across Apple platforms)\n");
         exit(1);
     }
     
